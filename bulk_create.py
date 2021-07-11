@@ -1,10 +1,38 @@
 from polymorphic.models import PolymorphicModel
 from polymorphic.query import PolymorphicQuerySet
 
+from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
-from django.db import models, connections, transaction
+from django.db import models, connections, connection, transaction
 from django.utils.functional import partition
+
+
+def reset_id_sequence(model_cls):
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT setval('{sequence_table}', (SELECT MAX(id) from \"{db_table}\"));".format(  # noqa
+                sequence_table='%s_id_seq' % model_cls._meta.db_table,
+                db_table=model_cls._meta.db_table
+            )
+        )
+
+
+class PrePKBulkCreateQuerySet(models.QuerySet):
+    def bulk_create(self, instances, batch_size=None, ignore_conflicts=False,
+            predetermine_pks=False):
+        if predetermine_pks is False:
+            return super().bulk_create(instances,
+                batch_size=batch_size, ignore_conflicts=ignore_conflicts)
+        try:
+            max_id = int(self.model.objects.latest('pk').pk)
+        except self.model.DoesNotExist:
+            max_id = 0
+
+        for i, instance in enumerate(instances):
+            setattr(instance, 'pk', max_id + i + 1)
+        return super().bulk_create(instances,
+                batch_size=batch_size, ignore_conflicts=ignore_conflicts)
 
 
 class BulkCreatePolymorphicQuerySet(PolymorphicQuerySet):
@@ -207,6 +235,19 @@ class BulkCreatePolymorphicQuerySet(PolymorphicQuerySet):
                 batch_size=batch_size,
                 ignore_conflicts=ignore_conflicts
             )
+
+            # NOTE: Since we are manually setting the the IDs, PostGres does
+            # not detect that the ID sequence needs to be automatically updated.
+            # Therefore, we need to do this ourselves.  This will not work for
+            # our SQLite test database though.
+            db_name = 'default'
+            if child_instances[0]._state.db is not None:
+                db_name = child_instances[0]._state.db
+
+            # This might also not work for MySQL but we don't use that ever.
+            db_backend = settings.DATABASES[db_name]['ENGINE'].split('.')[-1]
+            if db_backend != 'sqlite3':
+                reset_id_sequence(self.polymorphic_base)
 
             # Note that while the created children are fully represented with
             # all fields (both base and child) in the database, the children
